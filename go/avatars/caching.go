@@ -26,24 +26,34 @@ type avatarLoadSpec struct {
 	stales []avatarLoadPair
 }
 
-func (a avatarLoadSpec) missUsernames() (res []string) {
-	for _, u := range a.misses {
-		res = append(res, u.username)
+func (a avatarLoadSpec) details(l []avatarLoadPair) (names []string, formats []keybase1.AvatarFormat) {
+	fmap := make(map[keybase1.AvatarFormat]bool)
+	umap := make(map[string]bool)
+	for _, m := range l {
+		umap[m.username] = true
+		fmap[m.format] = true
 	}
-	return res
+	for u := range umap {
+		names = append(names, u)
+	}
+	for f := range fmap {
+		formats = append(formats, f)
+	}
+	return names, formats
 }
 
-func (a avatarLoadSpec) missFormats() (res []keybase1.AvatarFormat) {
-	for _, f := range a.misses {
-		res = append(res, f.format)
-	}
-	return res
+func (a avatarLoadSpec) missDetails() ([]string, []keybase1.AvatarFormat) {
+	return a.details(a.misses)
+}
+
+func (a avatarLoadSpec) staleDetails() ([]string, []keybase1.AvatarFormat) {
+	return a.details(a.stales)
 }
 
 type populateArg struct {
 	username string
 	format   keybase1.AvatarFormat
-	url      string
+	url      keybase1.AvatarUrl
 }
 
 type CachingSource struct {
@@ -133,7 +143,9 @@ func (c *CachingSource) commitAvatarToDisk(ctx context.Context, data io.ReadClos
 func (c *CachingSource) populateCacheWorker() {
 	for arg := range c.populateCacheCh {
 		ctx := context.Background()
-		resp, err := http.Get(arg.url)
+		c.debug(ctx, "populateCacheWorker: fetching: username: %s format: %s url: %s", arg.username,
+			arg.format, arg.url)
+		resp, err := http.Get(arg.url.String())
 		if err != nil {
 			c.debug(ctx, "populateCacheWorker: failed to download avatar: %s", err)
 			continue
@@ -157,8 +169,22 @@ func (c *CachingSource) populateCacheWorker() {
 	}
 }
 
+func (c *CachingSource) dispatchPopulateFromRes(ctx context.Context, res keybase1.LoadAvatarsRes) {
+	for username, rec := range res.Picmap {
+		for format, url := range rec {
+			if url != "" {
+				c.populateCacheCh <- populateArg{
+					username: username,
+					format:   format,
+					url:      url,
+				}
+			}
+		}
+	}
+}
+
 func (c *CachingSource) makeURL(path string) keybase1.AvatarUrl {
-	return keybase1.AvatarUrl("file://" + path)
+	return keybase1.MakeAvatarURL("file://" + path)
 }
 
 func (c *CachingSource) mergeRes(res *keybase1.LoadAvatarsRes, m keybase1.LoadAvatarsRes) {
@@ -170,26 +196,53 @@ func (c *CachingSource) mergeRes(res *keybase1.LoadAvatarsRes, m keybase1.LoadAv
 }
 
 func (c *CachingSource) LoadUsers(ctx context.Context, usernames []string, formats []keybase1.AvatarFormat) (res keybase1.LoadAvatarsRes, err error) {
+	defer c.G().Trace("CachingSource.LoadUsers", func() error { return err })()
 	loadSpec, err := c.specLoad(ctx, usernames, formats)
 	if err != nil {
 		return res, err
 	}
+	c.debug(ctx, "loadSpec: hits: %d stales: %d misses: %d", len(loadSpec.hits), len(loadSpec.stales),
+		len(loadSpec.misses))
 
 	// Fill in the hits
 	c.simpleSource.allocRes(&res, usernames)
 	for _, hit := range loadSpec.hits {
 		res.Picmap[hit.username][hit.format] = c.makeURL(hit.path)
 	}
-	// File in stale
+	// Fill in stales
 	for _, stale := range loadSpec.stales {
 		res.Picmap[stale.username][stale.format] = c.makeURL(stale.path)
 	}
 
 	// Go get the misses
-	missRes, err := c.simpleSource.LoadUsers(ctx, loadSpec.missUsernames(), loadSpec.missFormats())
-	if err != nil {
-		return res, err
+	missNames, missFormats := loadSpec.missDetails()
+	if len(missNames) > 0 {
+		loadRes, err := c.simpleSource.LoadUsers(ctx, missNames, missFormats)
+		if err == nil {
+			c.mergeRes(&res, loadRes)
+			c.dispatchPopulateFromRes(ctx, loadRes)
+		} else {
+			c.debug(ctx, "loadSpec: failed to load server miss reqs: %s", err)
+		}
 	}
-	c.mergeRes(&res, missRes)
+	// Spawn off a goroutine to reload stales
+	staleNames, staleFormats := loadSpec.staleDetails()
+	if len(staleNames) > 0 {
+		go func() {
+			c.debug(context.Background(), "loadSpec: spawning stale background load: names: %d",
+				len(staleNames))
+			loadRes, err := c.simpleSource.LoadUsers(context.Background(), staleNames, staleFormats)
+			if err == nil {
+				c.dispatchPopulateFromRes(ctx, loadRes)
+			} else {
+				c.debug(ctx, "loadSpec: failed to load server stale reqs: %s", err)
+			}
+		}()
+	}
 	return res, nil
+}
+
+func (c *CachingSource) LoadTeams(ctx context.Context, teams []string, formats []keybase1.AvatarFormat) (res keybase1.LoadAvatarsRes, err error) {
+	defer c.G().Trace("CachingSource.LoadTeams", func() error { return err })()
+	return c.simpleSource.LoadTeams(ctx, teams, formats)
 }

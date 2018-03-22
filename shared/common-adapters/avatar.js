@@ -121,7 +121,7 @@ const mapStateToProps = (state: TypedState, ownProps: Props) => {
   }
 
   return {
-    _needAskForData: !state.config.avatars.hasOwnProperty(name),
+    _needAskForData: true,
     _urlMap,
   }
 }
