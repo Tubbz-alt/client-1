@@ -17,7 +17,11 @@ type Source interface {
 }
 
 func CreateSourceFromEnv(g *libkb.GlobalContext) Source {
-	c := NewCachingSource(g, 6*time.Hour, 1000)
+	maxSize := 10000
+	if g.GetAppType() == libkb.MobileAppType {
+		maxSize = 2000
+	}
+	c := NewCachingSource(g, time.Hour, maxSize)
 	c.StartBackgroundTasks()
 	return c
 }

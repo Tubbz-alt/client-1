@@ -291,6 +291,7 @@ func (d *DiskLRU) addEntry(ctx context.Context, lctx libkb.LRUContext, index *di
 		var lastItem DiskLRUEntry
 		lastKey, err := index.OldestKey()
 		if err == nil {
+			d.debug(ctx, lctx, "evicting: %s", lastKey)
 			found, lastItem, err = d.readEntry(ctx, lctx, lastKey)
 			if err != nil {
 				return nil, err
@@ -354,4 +355,14 @@ func (d *DiskLRU) Flush(ctx context.Context, lctx libkb.LRUContext) error {
 	d.Lock()
 	defer d.Unlock()
 	return d.flush(ctx, lctx)
+}
+
+func (d *DiskLRU) Size(ctx context.Context, lctx libkb.LRUContext) (int, error) {
+	d.Lock()
+	defer d.Unlock()
+	index, err := d.readIndex(ctx, lctx)
+	if err != nil {
+		return 0, err
+	}
+	return index.Size(), nil
 }

@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/keybase/client/go/libkb"
@@ -85,11 +85,14 @@ func (c *CachingSource) StartBackgroundTasks() {
 	for i := 0; i < 10; i++ {
 		go c.populateCacheWorker()
 	}
-	if err := c.httpSrv.Start(); err != nil {
-		c.debug(context.Background(), "failed to start local http server, defaulting to simple mode")
-		c.simpleMode = true
-	} else {
-		c.httpSrv.HandleFunc("/a", c.serveHTTPAvatar)
+	// On mobile, using an HTTP interface is simpler so use it instead.
+	if c.isMobile() {
+		if err := c.httpSrv.Start(); err != nil {
+			c.debug(context.Background(), "failed to start local http server, defaulting to simple mode")
+			c.simpleMode = true
+		} else {
+			c.httpSrv.HandleFunc("/a", c.serveHTTPAvatar)
+		}
 	}
 }
 
@@ -97,6 +100,10 @@ func (c *CachingSource) StopBackgroundTasks() {
 	close(c.populateCacheCh)
 	c.simpleMode = false
 	c.httpSrv.Stop()
+}
+
+func (c *CachingSource) isMobile() bool {
+	return c.G().GetAppType() == libkb.MobileAppType
 }
 
 func (c *CachingSource) debug(ctx context.Context, msg string, args ...interface{}) {
@@ -137,26 +144,35 @@ func (c *CachingSource) specLoad(ctx context.Context, names []string, formats []
 	return res, nil
 }
 
-func (c *CachingSource) randomFileName() (string, error) {
-	return libkb.RandHexString("avatar", 16)
-}
-
-func (c *CachingSource) commitAvatarToDisk(ctx context.Context, data io.ReadCloser) (path string, err error) {
-	fileName, err := c.randomFileName()
+func (c *CachingSource) commitAvatarToDisk(ctx context.Context, data io.ReadCloser, previousPath string) (path string, err error) {
+	var file *os.File
+	if len(previousPath) > 0 {
+		c.debug(ctx, "commitAvatarToDisk: using previous path: %s", previousPath)
+		file, err = os.OpenFile(previousPath, os.O_RDWR, os.ModeAppend)
+	} else {
+		file, err = ioutil.TempFile(c.G().GetCacheDir(), "avatar")
+	}
 	if err != nil {
 		return path, err
 	}
-	path = filepath.Join(c.G().GetCacheDir(), fileName)
-	file, err := os.Create(path)
-	if err != nil {
-		return path, err
-	}
+	defer file.Close()
 	_, err = io.Copy(file, data)
 	if err != nil {
 		return path, err
 	}
-	file.Close()
+	path = file.Name()
 	return path, nil
+}
+
+func (c *CachingSource) removeFile(ctx context.Context, ent *lru.DiskLRUEntry) {
+	if ent != nil {
+		file := ent.Value.(string)
+		if err := os.Remove(file); err != nil {
+			c.debug(ctx, "removeFile: failed to remove: file: %s err: %s", file, err)
+		} else {
+			c.debug(ctx, "removeFile: successfully removed: %s", file)
+		}
+	}
 }
 
 func (c *CachingSource) populateCacheWorker() {
@@ -164,27 +180,37 @@ func (c *CachingSource) populateCacheWorker() {
 		ctx := context.Background()
 		c.debug(ctx, "populateCacheWorker: fetching: name: %s format: %s url: %s", arg.name,
 			arg.format, arg.url)
+		// Grab image data first
 		resp, err := http.Get(arg.url.String())
 		if err != nil {
 			c.debug(ctx, "populateCacheWorker: failed to download avatar: %s", err)
 			continue
 		}
-		path, err := c.commitAvatarToDisk(ctx, resp.Body)
+		// Find any previous path we stored this image at on the disk
+		var previousPath string
+		key := c.avatarKey(arg.name, arg.format)
+		found, ent, err := c.diskLRU.Get(ctx, c.G(), key)
+		if err != nil {
+			c.debug(ctx, "populateCacheWorker: failed to read previous entry in LRU: %s", err)
+			continue
+		}
+		if found {
+			previousPath = ent.Value.(string)
+		}
+
+		// Save to disk
+		path, err := c.commitAvatarToDisk(ctx, resp.Body, previousPath)
 		if err != nil {
 			c.debug(ctx, "populateCacheWorker: failed to write to disk: %s", err)
 			continue
 		}
-		evict, err := c.diskLRU.Put(ctx, c.G(), c.avatarKey(arg.name, arg.format), path)
+		evicted, err := c.diskLRU.Put(ctx, c.G(), key, path)
 		if err != nil {
 			c.debug(ctx, "populateCacheWorker: failed to put into LRU: %s", err)
 			continue
 		}
-		if evict != nil {
-			// Remove the file
-			if err := os.Remove(evict.Value.(string)); err != nil {
-				c.debug(ctx, "populateCacheWorker: failed to remove evicted file: %s", err)
-			}
-		}
+		// Remove any evicted file (if there is one)
+		c.removeFile(ctx, evicted)
 	}
 }
 
@@ -204,17 +230,22 @@ func (c *CachingSource) dispatchPopulateFromRes(ctx context.Context, res keybase
 
 func (c *CachingSource) serveHTTPAvatar(w http.ResponseWriter, req *http.Request) {
 	path := req.URL.Query().Get("p")
+	// Check path prefix
 	file, err := os.Open(path)
 	if err != nil {
 		c.debug(context.Background(), "serveHTTPAvatar: failed to read file: %s", err)
 		return
 	}
 	io.Copy(w, file)
+	file.Close()
 }
 
 func (c *CachingSource) makeURL(path string) keybase1.AvatarUrl {
-	addr, _ := c.httpSrv.Addr()
-	return keybase1.MakeAvatarURL(fmt.Sprintf("http://%s/a?p=%s", addr, path))
+	if c.isMobile() {
+		addr, _ := c.httpSrv.Addr()
+		return keybase1.MakeAvatarURL(fmt.Sprintf("http://%s/a?p=%s", addr, path))
+	}
+	return keybase1.MakeAvatarURL(fmt.Sprintf("file://%s", path))
 }
 
 func (c *CachingSource) mergeRes(res *keybase1.LoadAvatarsRes, m keybase1.LoadAvatarsRes) {
