@@ -65,29 +65,40 @@ type CachingSource struct {
 	staleThreshold time.Duration
 	simpleSource   *SimpleSource
 	httpSrv        *libkb.RandomPortHTTPSrv
+	simpleMode     bool
 
 	populateCacheCh chan populateArg
 }
 
-func NewCachingSource(g *libkb.GlobalContext, staleThreshold time.Duration, size int) (c *CachingSource, err error) {
-	c = &CachingSource{
-		Contextified:    libkb.NewContextified(g),
-		diskLRU:         lru.NewDiskLRU("avatars", 1, size),
-		staleThreshold:  staleThreshold,
-		simpleSource:    NewSimpleSource(g),
-		populateCacheCh: make(chan populateArg, 100),
-		httpSrv:         libkb.NewRandomPortHTTPSrv(),
-	}
+var _ Source = (*CachingSource)(nil)
 
+func NewCachingSource(g *libkb.GlobalContext, staleThreshold time.Duration, size int) *CachingSource {
+	return &CachingSource{
+		Contextified:   libkb.NewContextified(g),
+		diskLRU:        lru.NewDiskLRU("avatars", 1, size),
+		staleThreshold: staleThreshold,
+		simpleSource:   NewSimpleSource(g),
+		httpSrv:        libkb.NewRandomPortHTTPSrv(),
+	}
+}
+
+func (c *CachingSource) StartBackgroundTasks() {
+	c.populateCacheCh = make(chan populateArg, 100)
 	for i := 0; i < 10; i++ {
 		go c.populateCacheWorker()
 	}
-	if err = c.httpSrv.Start(); err != nil {
-		c.debug(context.Background(), "failed to start local http server, failing")
-		return nil, err
+	if err := c.httpSrv.Start(); err != nil {
+		c.debug(context.Background(), "failed to start local http server, defaulting to simple mode")
+		c.simpleMode = true
+	} else {
+		c.httpSrv.HandleFunc("/a", c.serveHTTPAvatar)
 	}
-	c.httpSrv.HandleFunc("/a", c.serveHTTPAvatar)
-	return c, nil
+}
+
+func (c *CachingSource) StopBackgroundTasks() {
+	close(c.populateCacheCh)
+	c.simpleMode = false
+	c.httpSrv.Stop()
 }
 
 func (c *CachingSource) debug(ctx context.Context, msg string, args ...interface{}) {
@@ -218,6 +229,10 @@ func (c *CachingSource) mergeRes(res *keybase1.LoadAvatarsRes, m keybase1.LoadAv
 
 func (c *CachingSource) LoadUsers(ctx context.Context, usernames []string, formats []keybase1.AvatarFormat) (res keybase1.LoadAvatarsRes, err error) {
 	defer c.G().Trace("CachingSource.LoadUsers", func() error { return err })()
+	// If we failed to startup our HTTP server, we just don't do any caching
+	if c.simpleMode {
+		return c.simpleSource.LoadUsers(ctx, usernames, formats)
+	}
 	loadSpec, err := c.specLoad(ctx, usernames, formats)
 	if err != nil {
 		return res, err

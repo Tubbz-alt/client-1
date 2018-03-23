@@ -28,6 +28,11 @@ func NewSimpleSource(g *libkb.GlobalContext) *SimpleSource {
 	}
 }
 
+var _ Source = (*SimpleSource)(nil)
+
+func (s *SimpleSource) StartBackgroundTasks() {}
+func (s *SimpleSource) StopBackgroundTasks()  {}
+
 func (s *SimpleSource) formatArg(formats []keybase1.AvatarFormat) string {
 	var strs []string
 	for _, f := range formats {

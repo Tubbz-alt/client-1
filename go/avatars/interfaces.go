@@ -11,12 +11,13 @@ import (
 type Source interface {
 	LoadUsers(context.Context, []string, []keybase1.AvatarFormat) (keybase1.LoadAvatarsRes, error)
 	LoadTeams(context.Context, []string, []keybase1.AvatarFormat) (keybase1.LoadAvatarsRes, error)
+
+	StartBackgroundTasks()
+	StopBackgroundTasks()
 }
 
 func CreateSourceFromEnv(g *libkb.GlobalContext) Source {
-	s, err := NewCachingSource(g, 6*time.Hour, 1000)
-	if err != nil {
-		return NewSimpleSource(g)
-	}
-	return s
+	c := NewCachingSource(g, 6*time.Hour, 1000)
+	c.StartBackgroundTasks()
+	return c
 }
