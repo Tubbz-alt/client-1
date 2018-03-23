@@ -62,22 +62,30 @@ type CachingSource struct {
 	diskLRU        *lru.DiskLRU
 	staleThreshold time.Duration
 	simpleSource   *SimpleSource
+	httpSrv        *libkb.RandomPortHTTPSrv
+	httpAddress    string
 
 	populateCacheCh chan populateArg
 }
 
-func NewCachingSource(g *libkb.GlobalContext, staleThreshold time.Duration, size int) *CachingSource {
-	c := &CachingSource{
+func NewCachingSource(g *libkb.GlobalContext, staleThreshold time.Duration, size int) (c *CachingSource, err error) {
+	c = &CachingSource{
 		Contextified:    libkb.NewContextified(g),
 		diskLRU:         lru.NewDiskLRU("avatars", 1, size),
 		staleThreshold:  staleThreshold,
 		simpleSource:    NewSimpleSource(g),
 		populateCacheCh: make(chan populateArg, 100),
+		httpSrv:         libkb.NewRandomPortHTTPSrv(),
 	}
 	for i := 0; i < 10; i++ {
 		go c.populateCacheWorker()
 	}
-	return c
+	c.httpAddress, err = c.httpSrv.Start()
+	if err != nil {
+		c.debug(context.Background(), "failed to start local http server, failing")
+		return nil, err
+	}
+	return c, nil
 }
 
 func (c *CachingSource) debug(ctx context.Context, msg string, args ...interface{}) {

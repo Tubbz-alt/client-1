@@ -14,5 +14,9 @@ type Source interface {
 }
 
 func CreateSourceFromEnv(g *libkb.GlobalContext) Source {
-	return NewCachingSource(g, 6*time.Hour, 1000)
+	s, err := NewCachingSource(g, 6*time.Hour, 1000)
+	if err != nil {
+		return NewSimpleSource(g)
+	}
+	return s
 }
