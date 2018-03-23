@@ -1,9 +1,11 @@
 package avatars
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -63,7 +65,6 @@ type CachingSource struct {
 	staleThreshold time.Duration
 	simpleSource   *SimpleSource
 	httpSrv        *libkb.RandomPortHTTPSrv
-	httpAddress    string
 
 	populateCacheCh chan populateArg
 }
@@ -77,14 +78,15 @@ func NewCachingSource(g *libkb.GlobalContext, staleThreshold time.Duration, size
 		populateCacheCh: make(chan populateArg, 100),
 		httpSrv:         libkb.NewRandomPortHTTPSrv(),
 	}
+
 	for i := 0; i < 10; i++ {
 		go c.populateCacheWorker()
 	}
-	c.httpAddress, err = c.httpSrv.Start()
-	if err != nil {
+	if err = c.httpSrv.Start(); err != nil {
 		c.debug(context.Background(), "failed to start local http server, failing")
 		return nil, err
 	}
+	c.httpSrv.HandleFunc("/a", c.serveHTTPAvatar)
 	return c, nil
 }
 
@@ -191,8 +193,19 @@ func (c *CachingSource) dispatchPopulateFromRes(ctx context.Context, res keybase
 	}
 }
 
+func (c *CachingSource) serveHTTPAvatar(w http.ResponseWriter, req *http.Request) {
+	path := req.URL.Query().Get("p")
+	dat, err := ioutil.ReadFile(path)
+	if err != nil {
+		c.debug(context.Background(), "serveHTTPAvatar: failed to read file: %s", err)
+		return
+	}
+	io.Copy(w, bytes.NewReader(dat))
+}
+
 func (c *CachingSource) makeURL(path string) keybase1.AvatarUrl {
-	return keybase1.MakeAvatarURL("file://" + path)
+	addr, _ := c.httpSrv.Addr()
+	return keybase1.MakeAvatarURL(fmt.Sprintf("http://%s/a?p=%s", addr, path))
 }
 
 func (c *CachingSource) mergeRes(res *keybase1.LoadAvatarsRes, m keybase1.LoadAvatarsRes) {
