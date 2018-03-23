@@ -1,11 +1,9 @@
 package avatars
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,9 +15,9 @@ import (
 )
 
 type avatarLoadPair struct {
-	username string
-	format   keybase1.AvatarFormat
-	path     string
+	name   string
+	format keybase1.AvatarFormat
+	path   string
 }
 
 type avatarLoadSpec struct {
@@ -32,7 +30,7 @@ func (a avatarLoadSpec) details(l []avatarLoadPair) (names []string, formats []k
 	fmap := make(map[keybase1.AvatarFormat]bool)
 	umap := make(map[string]bool)
 	for _, m := range l {
-		umap[m.username] = true
+		umap[m.name] = true
 		fmap[m.format] = true
 	}
 	for u := range umap {
@@ -53,9 +51,9 @@ func (a avatarLoadSpec) staleDetails() ([]string, []keybase1.AvatarFormat) {
 }
 
 type populateArg struct {
-	username string
-	format   keybase1.AvatarFormat
-	url      keybase1.AvatarUrl
+	name   string
+	format keybase1.AvatarFormat
+	url    keybase1.AvatarUrl
 }
 
 type CachingSource struct {
@@ -105,24 +103,24 @@ func (c *CachingSource) debug(ctx context.Context, msg string, args ...interface
 	c.G().Log.CDebugf(ctx, "Avatars.CachingSource: %s", fmt.Sprintf(msg, args...))
 }
 
-func (c *CachingSource) avatarKey(username string, format keybase1.AvatarFormat) string {
-	return fmt.Sprintf("%s:%s", username, format.String())
+func (c *CachingSource) avatarKey(name string, format keybase1.AvatarFormat) string {
+	return fmt.Sprintf("%s:%s", name, format.String())
 }
 
 func (c *CachingSource) isStale(item lru.DiskLRUEntry) bool {
 	return c.G().GetClock().Now().Sub(item.Ctime) > c.staleThreshold
 }
 
-func (c *CachingSource) specLoad(ctx context.Context, usernames []string, formats []keybase1.AvatarFormat) (res avatarLoadSpec, err error) {
-	for _, username := range usernames {
+func (c *CachingSource) specLoad(ctx context.Context, names []string, formats []keybase1.AvatarFormat) (res avatarLoadSpec, err error) {
+	for _, name := range names {
 		for _, format := range formats {
-			found, entry, err := c.diskLRU.Get(ctx, c.G(), c.avatarKey(username, format))
+			found, entry, err := c.diskLRU.Get(ctx, c.G(), c.avatarKey(name, format))
 			if err != nil {
 				return res, err
 			}
 			lp := avatarLoadPair{
-				username: username,
-				format:   format,
+				name:   name,
+				format: format,
 			}
 			if found {
 				lp.path = entry.Value.(string)
@@ -164,7 +162,7 @@ func (c *CachingSource) commitAvatarToDisk(ctx context.Context, data io.ReadClos
 func (c *CachingSource) populateCacheWorker() {
 	for arg := range c.populateCacheCh {
 		ctx := context.Background()
-		c.debug(ctx, "populateCacheWorker: fetching: username: %s format: %s url: %s", arg.username,
+		c.debug(ctx, "populateCacheWorker: fetching: name: %s format: %s url: %s", arg.name,
 			arg.format, arg.url)
 		resp, err := http.Get(arg.url.String())
 		if err != nil {
@@ -176,7 +174,7 @@ func (c *CachingSource) populateCacheWorker() {
 			c.debug(ctx, "populateCacheWorker: failed to write to disk: %s", err)
 			continue
 		}
-		evict, err := c.diskLRU.Put(ctx, c.G(), c.avatarKey(arg.username, arg.format), path)
+		evict, err := c.diskLRU.Put(ctx, c.G(), c.avatarKey(arg.name, arg.format), path)
 		if err != nil {
 			c.debug(ctx, "populateCacheWorker: failed to put into LRU: %s", err)
 			continue
@@ -191,13 +189,13 @@ func (c *CachingSource) populateCacheWorker() {
 }
 
 func (c *CachingSource) dispatchPopulateFromRes(ctx context.Context, res keybase1.LoadAvatarsRes) {
-	for username, rec := range res.Picmap {
+	for name, rec := range res.Picmap {
 		for format, url := range rec {
 			if url != "" {
 				c.populateCacheCh <- populateArg{
-					username: username,
-					format:   format,
-					url:      url,
+					name:   name,
+					format: format,
+					url:    url,
 				}
 			}
 		}
@@ -206,12 +204,12 @@ func (c *CachingSource) dispatchPopulateFromRes(ctx context.Context, res keybase
 
 func (c *CachingSource) serveHTTPAvatar(w http.ResponseWriter, req *http.Request) {
 	path := req.URL.Query().Get("p")
-	dat, err := ioutil.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		c.debug(context.Background(), "serveHTTPAvatar: failed to read file: %s", err)
 		return
 	}
-	io.Copy(w, bytes.NewReader(dat))
+	io.Copy(w, file)
 }
 
 func (c *CachingSource) makeURL(path string) keybase1.AvatarUrl {
@@ -227,13 +225,9 @@ func (c *CachingSource) mergeRes(res *keybase1.LoadAvatarsRes, m keybase1.LoadAv
 	}
 }
 
-func (c *CachingSource) LoadUsers(ctx context.Context, usernames []string, formats []keybase1.AvatarFormat) (res keybase1.LoadAvatarsRes, err error) {
-	defer c.G().Trace("CachingSource.LoadUsers", func() error { return err })()
-	// If we failed to startup our HTTP server, we just don't do any caching
-	if c.simpleMode {
-		return c.simpleSource.LoadUsers(ctx, usernames, formats)
-	}
-	loadSpec, err := c.specLoad(ctx, usernames, formats)
+func (c *CachingSource) loadNames(ctx context.Context, names []string, formats []keybase1.AvatarFormat,
+	remoteFetch func(context.Context, []string, []keybase1.AvatarFormat) (keybase1.LoadAvatarsRes, error)) (res keybase1.LoadAvatarsRes, err error) {
+	loadSpec, err := c.specLoad(ctx, names, formats)
 	if err != nil {
 		return res, err
 	}
@@ -241,19 +235,19 @@ func (c *CachingSource) LoadUsers(ctx context.Context, usernames []string, forma
 		len(loadSpec.misses))
 
 	// Fill in the hits
-	c.simpleSource.allocRes(&res, usernames)
+	c.simpleSource.allocRes(&res, names)
 	for _, hit := range loadSpec.hits {
-		res.Picmap[hit.username][hit.format] = c.makeURL(hit.path)
+		res.Picmap[hit.name][hit.format] = c.makeURL(hit.path)
 	}
 	// Fill in stales
 	for _, stale := range loadSpec.stales {
-		res.Picmap[stale.username][stale.format] = c.makeURL(stale.path)
+		res.Picmap[stale.name][stale.format] = c.makeURL(stale.path)
 	}
 
 	// Go get the misses
 	missNames, missFormats := loadSpec.missDetails()
 	if len(missNames) > 0 {
-		loadRes, err := c.simpleSource.LoadUsers(ctx, missNames, missFormats)
+		loadRes, err := remoteFetch(ctx, missNames, missFormats)
 		if err == nil {
 			c.mergeRes(&res, loadRes)
 			c.dispatchPopulateFromRes(ctx, loadRes)
@@ -267,7 +261,7 @@ func (c *CachingSource) LoadUsers(ctx context.Context, usernames []string, forma
 		go func() {
 			c.debug(context.Background(), "loadSpec: spawning stale background load: names: %d",
 				len(staleNames))
-			loadRes, err := c.simpleSource.LoadUsers(context.Background(), staleNames, staleFormats)
+			loadRes, err := remoteFetch(context.Background(), staleNames, staleFormats)
 			if err == nil {
 				c.dispatchPopulateFromRes(ctx, loadRes)
 			} else {
@@ -278,7 +272,19 @@ func (c *CachingSource) LoadUsers(ctx context.Context, usernames []string, forma
 	return res, nil
 }
 
+func (c *CachingSource) LoadUsers(ctx context.Context, usernames []string, formats []keybase1.AvatarFormat) (res keybase1.LoadAvatarsRes, err error) {
+	defer c.G().Trace("CachingSource.LoadUsers", func() error { return err })()
+	// If we failed to startup our HTTP server, we just don't do any caching
+	if c.simpleMode {
+		return c.simpleSource.LoadUsers(ctx, usernames, formats)
+	}
+	return c.loadNames(ctx, usernames, formats, c.simpleSource.LoadUsers)
+}
+
 func (c *CachingSource) LoadTeams(ctx context.Context, teams []string, formats []keybase1.AvatarFormat) (res keybase1.LoadAvatarsRes, err error) {
 	defer c.G().Trace("CachingSource.LoadTeams", func() error { return err })()
-	return c.simpleSource.LoadTeams(ctx, teams, formats)
+	if c.simpleMode {
+		return c.simpleSource.LoadTeams(ctx, teams, formats)
+	}
+	return c.loadNames(ctx, teams, formats, c.simpleSource.LoadTeams)
 }
